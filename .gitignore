@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# env
+.env
+.env.local
+.env.*.local
+
+# backend build output
+backend/dist/
+
+# frontend (Next.js)
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+
+# logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+
+# docker
+postgres-data/
+redis-data/
+elasticsearch-data/

@@ -1,0 +1,19 @@
+{
+  "name": "reachinbox-email-scheduler",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace backend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "build:backend": "npm run build --workspace backend",
+    "build:frontend": "npm run build --workspace frontend",
+    "typecheck:backend": "npm run typecheck --workspace backend",
+    "typecheck:frontend": "npm run typecheck --workspace frontend",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:ps": "docker compose ps"
+  }
+}
