@@ -32,7 +32,20 @@ const envSchema = z.object({
   SLACK_CLIENT_ID: z.string().min(1, "SLACK_CLIENT_ID is required"),
   SLACK_CLIENT_SECRET: z.string().min(1, "SLACK_CLIENT_SECRET is required"),
 
-  SESSION_SECRET: z.string().min(1, "SESSION_SECRET is required"),
+  // Signs session cookies (ADR-012) and Slack OAuth state tokens (lib/slack.ts)
+  // — a short or default value would let anyone forge a valid session for
+  // any user id. The literal .env.example placeholder is checked explicitly
+  // because it's a public, well-known string (33 chars — long enough to
+  // slip past a plain length check) committed in this very repo; deploying
+  // without changing it is a real, realistic misconfiguration, not a
+  // hypothetical one.
+  SESSION_SECRET: z
+    .string()
+    .min(32, "SESSION_SECRET must be at least 32 characters — it signs session cookies; a short value is forgeable")
+    .refine(
+      (v) => v !== "change-me-to-a-long-random-string",
+      "SESSION_SECRET is still set to the .env.example placeholder — sessions would be forgeable by anyone who has read this repo. Set a real random secret."
+    ),
   ADMIN_EMAILS: z.string().min(1, "ADMIN_EMAILS is required"),
 
   FRONTEND_URL: z.string().min(1, "FRONTEND_URL is required"),

@@ -767,12 +767,23 @@ write to the index idempotent (an update with the same id overwrites, it
 never creates a duplicate document).
 
 **Fields:** `to_email`, `subject`, `body`, `status`, `scheduled_at`,
-`sent_at`, `sender` (denormalized sender email, for display without a join).
+`sent_at`, `sender` (denormalized sender email, for display without a join),
+`campaign_id`, and `user_id`. The last two aren't part of the full-text
+query — `user_id` exists specifically so `GET /emails/search` can filter to
+the caller's own emails (a requirement the original design here predates);
+`campaign_id` supports linking a hit back to its campaign.
 
-**When indexing happens.** On email creation (`scheduled`) and again on every
-status change (`processing`, `sent`, `failed`, or back to `scheduled` on
-reschedule) — the document is kept eventually consistent with the row that
-drives it, not just written once at creation.
+**When indexing happens.** The implemented scope is narrower than an
+earlier draft of this section described: only on a successful send
+(`status` transitions to `sent`), not on creation or every intermediate
+status change. This was a deliberate simplification — a `scheduled` or
+`failed` email isn't part of the documented search use case (searching the
+Sent tab), and indexing on every transition would add Elasticsearch calls
+to the hot claim/lock/rate-limit path for no requirement that calls for it.
+`backend/scripts/backfill-elasticsearch.ts` re-indexes every `sent` email
+from Postgres on demand — the catch-up mechanism after an ES outage or any
+gap, instead of making the worker's send path more fragile to keep the
+index perfectly current in real time.
 
 **Search endpoint.** `GET /emails/search?q=...` runs a `multi_match` query
 against `to_email`, `subject`, and `body`, returning the same item shape as
@@ -806,13 +817,10 @@ not sufficient to view the queue dashboard.
 
 ## API architecture
 
-The **Auth** column below states each route's intended, final auth
-requirement. `POST /campaigns` was implemented ahead of Phase 7 (to make
-Phase 4's idempotency-key behavior testable) and is currently gated by the
-temporary `X-Dev-User-Id` header instead of a real session cookie — see
-ADR-023. That row's "session cookie" therefore describes the design target,
-not (yet) the running code; ADR-023 is explicit that this is temporary and
-gets deleted, not extended, once Phase 7 lands.
+Every route below is gated by the real session-cookie middleware (ADR-012).
+The earlier temporary `X-Dev-User-Id` mechanism (ADR-023) has been fully
+replaced for all production routes and is no longer reachable through any
+of them — see ADR-023's now-superseded status for that migration.
 
 | Method & path | Purpose | Auth |
 | --- | --- | --- |
@@ -820,10 +828,12 @@ gets deleted, not extended, once Phase 7 lands.
 | `GET /auth/google/callback` | Finish Google OAuth, set session cookie | none (validates OAuth state/code) |
 | `GET /auth/me` | Current user for the header | session cookie |
 | `POST /auth/logout` | Clear session | session cookie |
-| `POST /campaigns` | Create a campaign for one selected `senderId`, with optional `startAt`/`delayBetweenEmailsMs`/`hourlyLimit` overrides (ADR-021, ADR-022): insert email rows, enqueue jobs | session cookie (temporarily: `X-Dev-User-Id` header, ADR-023) |
+| `POST /campaigns` | Create a campaign for one selected `senderId`, with optional `startAt`/`delayBetweenEmailsMs`/`hourlyLimit` overrides (ADR-021, ADR-022): insert email rows, enqueue jobs | session cookie |
+| `GET /campaigns` | List the authenticated user's campaigns, paginated, with per-status progress counts | session cookie |
+| `GET /campaigns/:id` | One campaign's detail; `404` (not `403`) if it doesn't exist or isn't owned by the caller | session cookie |
 | `GET /emails?status=scheduled` | Scheduled list, paginated | session cookie |
 | `GET /emails?status=sent` | Sent list, paginated (`sent`/`failed`) | session cookie |
-| `GET /emails/search` | Full-text search over all emails | session cookie |
+| `GET /emails/search` | Full-text search over the caller's own emails only | session cookie |
 | `GET /senders` | Senders and their current-hour usage | session cookie |
 | `GET /slack/install` | Start Slack OAuth | session cookie |
 | `GET /slack/callback` | Finish Slack OAuth, store connection | session cookie (via signed `state`) |

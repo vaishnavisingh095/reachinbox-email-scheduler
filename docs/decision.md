@@ -1077,9 +1077,15 @@ schema or write path from ADR-020.
 
 ## ADR-023: Temporary pre-OAuth development identity header (`X-Dev-User-Id`)
 
-**Status:** Accepted — **explicitly temporary**. Superseded in full by
-ADR-012's real session-cookie middleware once Phase 7 lands; this ADR
-should be marked superseded at that point, not deleted.
+**Status:** **Superseded by ADR-012.** Real Google OAuth and session-cookie
+middleware now exist (`backend/src/middleware/sessionAuth.ts`) and every
+production route uses it via `authMode.ts`'s `requireAuth` export —
+`devAuth`/`X-Dev-User-Id` is no longer imported by any route and cannot
+authenticate a production request. This ADR is preserved in full below as
+historical record of why the shim existed and what it traded off, per this
+project's rule that a superseded decision is marked, not deleted.
+`backend/src/middleware/devAuth.ts` itself remains in the codebase, usable
+only for direct manual/local testing outside the normal request path.
 
 **Context.** Phase 4 needed `POST /campaigns` to exist so the
 `idempotency_keys` behavior from ADR-018 could actually be tested end to

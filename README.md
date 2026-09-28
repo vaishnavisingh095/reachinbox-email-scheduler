@@ -5,11 +5,13 @@ A restart-safe, rate-limited email campaign scheduler. See
 [`docs/decision.md`](./docs/decision.md) for why it's built this way, and
 [`docs/plan.md`](./docs/plan.md) for the build sequence.
 
-**Status:** Phase 1 (project foundation) complete — infrastructure,
-environment validation, and a `/health` endpoint. No application features
-(scheduling, auth, rate limiting) exist yet. This README will be expanded
-into the full submission README in Phase 14; for now it only covers what's
-needed to run what exists.
+**Status:** Backend is functionally complete — scheduling, delivery,
+reliability/idempotency, rate limiting, the campaign/senders/emails read
+API, Elasticsearch search, Bull Board, Google OAuth + sessions, and Slack
+OAuth + rate-limit notifications all exist and are wired together. The
+Next.js frontend is still just the Phase 1 shell page — no dashboard or
+compose UI yet. This README will be expanded into the full submission
+README later; for now it covers what's needed to run what exists.
 
 ## Prerequisites
 
@@ -41,21 +43,85 @@ docker compose ps   # postgres, redis, elasticsearch should all be "healthy"
 > your machine, change the mapping in `docker-compose.yml` and the port in
 > your `.env` together.
 
+## Database
+
+```bash
+npm run db:migrate   # applies Prisma migrations
+npm run db:seed       # 2 dev users, 3 senders, 4 campaigns, 8 emails
+```
+
+Seeded senders use placeholder Ethereal credentials (`@ethereal.invalid`) —
+real sends need a real Ethereal test account's `user`/`pass` written onto a
+`senders` row (Ethereal accounts are created via
+`nodemailer.createTestAccount()`, free and instant, but not created
+automatically — see ADR-011).
+
 ## Running the backend
 
 ```bash
-npm run dev:backend
+npm run dev:backend     # API on :4000
+npm run dev:worker      # BullMQ worker — separate process, run alongside the API
+```
+
+```bash
 curl http://localhost:4000/health
 ```
 
-`/health` returns `200` with `{"status":"ok", ...}` once the API can reach
-Postgres and Redis (Elasticsearch is intentionally not part of this check —
-see `docs/architecture.md`'s Elasticsearch section for why). If a required
+returns `200` once the API can reach Postgres and Redis. If a required
 environment variable is missing, the process fails immediately on boot with
-a list of what's missing, rather than starting in a broken state.
+a list of what's missing.
 
-Other backend scripts: `npm run build:backend` (compiles to `backend/dist`),
-`npm run typecheck:backend`.
+Other backend scripts: `npm run build:backend`, `npm run typecheck:backend`,
+`npm run db:studio` (Prisma Studio), `npm run db:migrate`, `npm run db:seed`.
+
+## Google OAuth setup
+
+1. Create an OAuth 2.0 Client ID (Web application) at
+   [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
+2. Add an authorized redirect URI: `{API_URL}/auth/google/callback`
+   (`http://localhost:4000/auth/google/callback` for local dev).
+3. Put the client id/secret in `.env` as `GOOGLE_CLIENT_ID` /
+   `GOOGLE_CLIENT_SECRET`.
+4. Visit `http://localhost:4000/auth/google` in a browser to sign in;
+   `GET /auth/me` reflects the session, `POST /auth/logout` clears it.
+
+Without real credentials, the OAuth code path still runs end-to-end up to
+Google's own consent screen (the redirect URL, state/CSRF handling, and
+token-exchange error handling are all real and testable) — only the actual
+Google login itself needs a registered app.
+
+## Slack OAuth setup
+
+1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps)
+   with the `incoming-webhook` OAuth scope.
+2. Add a redirect URL: `{API_URL}/slack/callback`.
+3. Put the client id/secret in `.env` as `SLACK_CLIENT_ID` /
+   `SLACK_CLIENT_SECRET`.
+4. With a session cookie set (via Google login above), visit
+   `http://localhost:4000/slack/install` to connect.
+
+When a sender's hourly limit is hit, the worker posts a rate-limit
+notification to the connected Slack destination — deduplicated per
+`(sender, hour window)`, and a complete no-op (never a crash, never affects
+the reschedule) if nothing is connected.
+
+## Elasticsearch
+
+Search is a derived index over `emails` — Postgres remains the source of
+truth (ADR-010). Only successful sends are indexed on the hot path; if the
+index falls behind (e.g. after an ES outage), run:
+
+```bash
+cd backend && npx tsx scripts/backfill-elasticsearch.ts
+```
+
+to re-index every `sent` email from Postgres. `GET /emails/search?q=...`
+is scoped to the caller's own emails.
+
+## Bull Board
+
+`http://localhost:4000/admin/queues` — gated by session + the
+`ADMIN_EMAILS` allow-list (comma-separated emails in `.env`).
 
 ## Running the frontend
 
@@ -64,7 +130,7 @@ npm run dev:frontend
 ```
 
 Loads at `http://localhost:3000` — currently a minimal shell page only; no
-dashboard, auth, or campaign UI yet (that's Phase 11).
+dashboard, auth, or campaign UI yet.
 
 Other frontend scripts: `npm run build:frontend`, `npm run typecheck:frontend`,
 `npm run lint --workspace frontend`.
@@ -72,7 +138,5 @@ Other frontend scripts: `npm run build:frontend`, `npm run typecheck:frontend`,
 ## Environment variables
 
 `.env.example` lists every variable this system uses, matching
-`docs/architecture.md`'s documented list exactly. Google/Slack OAuth
-variables are placeholders until Phases 7–8 add those integrations; they
-must still be *present* (even as placeholders) for the backend's startup
-validation to pass.
+`docs/architecture.md`'s documented list exactly, with setup notes for the
+Google/Slack credentials above.

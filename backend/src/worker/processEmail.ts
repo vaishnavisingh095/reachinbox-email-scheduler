@@ -2,9 +2,11 @@ import { prisma } from "../lib/prisma";
 import { env } from "../config/env";
 import { claimEmail } from "./claimEmail";
 import { acquireSenderLock } from "../queue/senderLock";
-import { checkAndIncrementRateLimits, getNextHourStart } from "../queue/rateLimit";
+import { checkAndIncrementRateLimits, getHourWindow, getNextHourStart } from "../queue/rateLimit";
 import { sendViaEthereal } from "../mail/ethereal";
 import { recordRateWindowSend } from "./rateWindowAudit";
+import { indexEmail } from "../search/emailIndex";
+import { notifyRateLimitBlocked } from "../queue/slackNotify";
 
 // A small random jitter so every blocked job for a sender doesn't retry at
 // exactly the same instant (architecture.md's Minimum send delay / Hourly
@@ -55,6 +57,7 @@ export async function processEmail(emailId: string): Promise<ProcessResult> {
   }
 
   const campaign = await prisma.campaign.findUniqueOrThrow({ where: { id: claimed.campaignId } });
+  const sender = await prisma.sender.findUniqueOrThrow({ where: { id: claimed.senderId } });
   const now = new Date();
   const rateLimitGranted = await checkAndIncrementRateLimits({
     senderId: claimed.senderId,
@@ -69,10 +72,18 @@ export async function processEmail(emailId: string): Promise<ProcessResult> {
       where: { id: emailId },
       data: { status: "scheduled", scheduledAt },
     });
+    // Worker-side (this is the process that observes the limit), best-
+    // effort, deduplicated, and a complete no-op if nothing is connected —
+    // never affects the reschedule above either way.
+    await notifyRateLimitBlocked({
+      userId: campaign.userId,
+      senderId: claimed.senderId,
+      senderEmail: sender.email,
+      campaignSubject: campaign.subject,
+      hourWindow: getHourWindow(now),
+    });
     return { outcome: "rescheduled", reason: "rate-limit", scheduledAt: scheduledAt.toISOString() };
   }
-
-  const sender = await prisma.sender.findUniqueOrThrow({ where: { id: claimed.senderId } });
 
   try {
     const { messageId, previewUrl } = await sendViaEthereal(sender, campaign, claimed);
@@ -89,12 +100,16 @@ export async function processEmail(emailId: string): Promise<ProcessResult> {
       where: { id: emailId },
       data: { messageId, previewUrl: previewUrl || null },
     });
+    const sentAt = new Date();
     await prisma.email.update({
       where: { id: emailId },
-      data: { status: "sent", sentAt: new Date() },
+      data: { status: "sent", sentAt },
     });
     // Durable audit only (ADR-020) — never gates the outcome above.
     await recordRateWindowSend(claimed.senderId, now);
+    // Best-effort search indexing (ADR-010) — indexEmail() swallows its
+    // own errors; an Elasticsearch outage must never affect this outcome.
+    await indexEmail({ ...claimed, status: "sent", sentAt }, campaign, sender);
     return { outcome: "sent", messageId };
   } catch (err) {
     const error = describeError(err);

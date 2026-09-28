@@ -19,6 +19,7 @@ declare global {
   namespace Express {
     interface Request {
       userId?: string;
+      userEmail?: string;
     }
   }
 }
@@ -45,5 +46,6 @@ export async function devAuth(req: Request, res: Response, next: NextFunction) {
   }
 
   req.userId = user.id;
+  req.userEmail = user.email;
   next();
 }
