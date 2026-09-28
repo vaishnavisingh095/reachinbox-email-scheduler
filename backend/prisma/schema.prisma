@@ -102,6 +102,7 @@ model Email {
   attempts    Int         @default(0)
   error       String?
   messageId   String?     @map("message_id")
+  previewUrl  String?     @map("preview_url")
   jobId       String?     @unique @map("job_id")
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")

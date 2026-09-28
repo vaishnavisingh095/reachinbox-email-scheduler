@@ -197,7 +197,8 @@ BullMQ job. Everything about throughput, idempotency, and the dashboard views
 is really a statement about this table.
 
 Key columns: `id`, `campaign_id`, `sender_id`, `to_email`, `scheduled_at`,
-`status`, `sent_at`, `attempts`, `error`, `message_id`, `job_id`.
+`status`, `sent_at`, `attempts`, `error`, `message_id`, `preview_url`,
+`job_id`.
 
 `campaigns` additionally carries `sender_id` (the single sender selected at
 creation — ADR-019) and three **required, non-null** scheduling-control
