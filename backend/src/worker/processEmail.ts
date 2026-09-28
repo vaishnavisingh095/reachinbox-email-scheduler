@@ -76,16 +76,22 @@ export async function processEmail(emailId: string): Promise<ProcessResult> {
 
   try {
     const { messageId, previewUrl } = await sendViaEthereal(sender, campaign, claimed);
-    // Written together, immediately after the send call succeeds — the
-    // narrowest achievable version of the SMTP/DB crash window (ADR-017).
+    // Two deliberately SEPARATE writes (ADR-017): message_id first, status
+    // second. A single combined write would mean Postgres's own atomicity
+    // makes the row's fate binary — either both land (status becomes
+    // 'sent') or neither does (message_id stays null) — which collapses
+    // ADR-017's two distinct crash outcomes into one and silently treats
+    // some genuinely-ambiguous rows as "safe to retry". Splitting the
+    // writes makes the documented ambiguous window (message_id present,
+    // status still 'processing') a real, narrow, reachable state instead
+    // of dead code in reconcile.ts.
     await prisma.email.update({
       where: { id: emailId },
-      data: {
-        status: "sent",
-        sentAt: new Date(),
-        messageId,
-        previewUrl: previewUrl || null,
-      },
+      data: { messageId, previewUrl: previewUrl || null },
+    });
+    await prisma.email.update({
+      where: { id: emailId },
+      data: { status: "sent", sentAt: new Date() },
     });
     // Durable audit only (ADR-020) — never gates the outcome above.
     await recordRateWindowSend(claimed.senderId, now);
