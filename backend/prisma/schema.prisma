@@ -1,0 +1,171 @@
+// Prisma schema — the authoritative field list for docs/architecture.md's
+// data model. Table/column names use @@map/@map to match the documented
+// snake_case names on disk; model/field names stay idiomatic camelCase for
+// the generated TypeScript client.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Email lifecycle (architecture.md "Email lifecycle"):
+//   scheduled -> processing -> sent | failed
+//   processing -> scheduled (on rate-limit reschedule, ADR-008)
+enum EmailStatus {
+  scheduled
+  processing
+  sent
+  failed
+
+  @@map("email_status")
+}
+
+// One row per Google-authenticated account.
+model User {
+  id        String   @id @default(uuid())
+  googleId  String   @unique @map("google_id")
+  email     String   @unique
+  name      String
+  avatarUrl String?  @map("avatar_url")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  senders         Sender[]
+  campaigns       Campaign[]
+  slackConnection SlackConnection?
+  idempotencyKeys IdempotencyKey[]
+
+  @@map("users")
+}
+
+// One row per Ethereal SMTP identity, belongs to a user (ADR-011: one
+// Ethereal test account per sender, created once and persisted).
+model Sender {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  email        String
+  etherealPass String   @map("ethereal_pass")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user        User         @relation(fields: [userId], references: [id])
+  campaigns   Campaign[]
+  emails      Email[]
+  rateWindows RateWindow[]
+
+  @@map("senders")
+}
+
+// One row per compose action. Belongs to a user and exactly one sender,
+// explicitly selected at creation (ADR-019) — never chosen implicitly.
+// start_at / delay_between_emails_ms / hourly_limit are the compose UI's
+// functional scheduling controls (ADR-021, ADR-022): resolved from the
+// user's input or the MIN_DELAY_MS / MAX_EMAILS_PER_HOUR_PER_SENDER
+// defaults at creation time, and persisted — never a live fallback to the
+// environment afterward.
+model Campaign {
+  id                   String   @id @default(uuid())
+  userId               String   @map("user_id")
+  senderId             String   @map("sender_id")
+  subject              String
+  body                 String
+  startAt              DateTime @map("start_at")
+  delayBetweenEmailsMs Int      @map("delay_between_emails_ms")
+  hourlyLimit          Int      @map("hourly_limit")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  user            User             @relation(fields: [userId], references: [id])
+  sender          Sender           @relation(fields: [senderId], references: [id])
+  emails          Email[]
+  idempotencyKeys IdempotencyKey[]
+
+  @@map("campaigns")
+}
+
+// One row per recipient of one campaign = one BullMQ job (ADR-003).
+// sender_id is always inherited from the campaign, never chosen
+// per-recipient. job_id is nullable until the BullMQ job is actually
+// created (ADR-004: job id = this row's id, once assigned).
+model Email {
+  id          String      @id @default(uuid())
+  campaignId  String      @map("campaign_id")
+  senderId    String      @map("sender_id")
+  toEmail     String      @map("to_email")
+  scheduledAt DateTime    @map("scheduled_at")
+  status      EmailStatus @default(scheduled)
+  sentAt      DateTime?   @map("sent_at")
+  attempts    Int         @default(0)
+  error       String?
+  messageId   String?     @map("message_id")
+  jobId       String?     @unique @map("job_id")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id])
+  sender   Sender   @relation(fields: [senderId], references: [id])
+
+  // Re-submitting the same campaign payload cannot create a second row
+  // for the same recipient.
+  @@unique([campaignId, toEmail])
+  // Used by the Scheduled/Sent dashboard lists and boot-time reconciliation.
+  @@index([status, scheduledAt])
+  @@map("emails")
+}
+
+// Durable audit of hourly sends per sender (ADR-020) — Redis remains the
+// sole live enforcement authority; this table is written downstream of
+// that check, never gating it.
+model RateWindow {
+  id          String   @id @default(uuid())
+  senderId    String   @map("sender_id")
+  windowStart DateTime @map("window_start")
+  count       Int      @default(0)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  sender Sender @relation(fields: [senderId], references: [id])
+
+  @@unique([senderId, windowStart])
+  @@map("rate_windows")
+}
+
+// One row per user's Slack OAuth result. Either an incoming webhook or a
+// bot token + channel, per architecture.md's Slack OAuth section.
+model SlackConnection {
+  id          String   @id @default(uuid())
+  userId      String   @unique @map("user_id")
+  teamId      String   @map("team_id")
+  teamName    String   @map("team_name")
+  accessToken String?  @map("access_token")
+  webhookUrl  String?  @map("webhook_url")
+  channelId   String?  @map("channel_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("slack_connections")
+}
+
+// PostgreSQL-backed API idempotency for POST /campaigns (ADR-018) — the
+// key is scoped to the authenticated user, not global. Not Redis-backed:
+// this must survive Redis loss and API restarts.
+model IdempotencyKey {
+  id           String   @id @default(uuid())
+  key          String
+  userId       String   @map("user_id")
+  campaignId   String   @map("campaign_id")
+  responseBody Json     @map("response_body")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id])
+  campaign Campaign @relation(fields: [campaignId], references: [id])
+
+  @@unique([userId, key])
+  @@map("idempotency_keys")
+}

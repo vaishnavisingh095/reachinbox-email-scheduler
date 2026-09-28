@@ -14,6 +14,10 @@
     "typecheck:frontend": "npm run typecheck --workspace frontend",
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
-    "infra:ps": "docker compose ps"
+    "infra:ps": "docker compose ps",
+    "db:migrate": "npm run db:migrate --workspace backend",
+    "db:generate": "npm run db:generate --workspace backend",
+    "db:seed": "npm run db:seed --workspace backend",
+    "db:studio": "npm run db:studio --workspace backend"
   }
 }
