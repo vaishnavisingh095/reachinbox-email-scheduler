@@ -569,11 +569,11 @@ providers don't reliably provide either). Absent either of those, any claim
 of guaranteed exactly-once delivery would be describing a system that
 doesn't exist. What's implementable, and is implemented, is: make the
 ambiguous window as narrow as possible (write the `message_id` immediately
-after the SMTP call returns, in the same code path as the status update),
-and when reconciliation finds a row stuck in `processing`, use the presence
-or absence of `message_id` to distinguish "probably never sent, safe to
-retry" from "possibly already sent, needs review" rather than guessing in
-the direction of a duplicate send.
+after the SMTP call returns, then write the status update right after), and
+when reconciliation finds a row stuck in `processing`, use the presence or
+absence of `message_id` to distinguish "probably never sent, safe to retry"
+from "possibly already sent, needs review" rather than guessing in the
+direction of a duplicate send.
 
 **Alternatives considered.**
 
@@ -599,6 +599,25 @@ own sent log for that message, rather than resolving itself automatically.
 This is accepted as strictly better than either alternative above: it's the
 one option that doesn't quietly convert a rare failure into either a
 duplicate send or a silent loss.
+
+**Implementation implications (precision fix, Phase 4).** The `message_id`
+write and the `status = 'sent'` write are **two separate, sequential SQL
+statements** — not one combined write. This was tightened during Phase 4
+after reviewing the actual worker code: an earlier implementation wrote
+both fields in a single `UPDATE`, which is more "atomic-looking" but is
+actually the *wrong* atomicity for this mechanism. A single combined write
+means Postgres's own guarantee — a statement either fully commits or not at
+all — collapses this ADR's two crash outcomes into one: `message_id` would
+only ever be observed as *absent* after a crash, never as *present with
+`status` still `processing`*, silently making the "possibly already sent"
+branch of the reconciliation logic above unreachable in real operation
+(defeating the reason this ADR calls for storing `message_id` separately at
+all). Splitting the write into two sequential statements is what makes the
+ambiguous window a real, narrow, detectable state rather than dead code.
+This does not change the decision above — the guarantee is still
+at-most-once, ambiguous rows are still surfaced rather than resolved
+automatically — it corrects how narrowly and correctly that guarantee is
+actually realized in code.
 
 ---
 
@@ -667,9 +686,39 @@ negligible relative to the correctness it buys.
 at the database level, not just checked in application code, so a race
 between two concurrent retries of the same request cannot both "win." The
 lookup happens before the campaign/emails insert transaction begins; on a
-hit, the stored `response_body` is returned as-is and no new campaign,
-email rows, or BullMQ jobs are created. This table is part of the Phase 2
-schema, alongside the original six tables.
+hit **that matches the original request** (see below), the stored
+`response_body` is returned as-is and no new campaign, email rows, or
+BullMQ jobs are created. This table is part of the Phase 2 schema, alongside
+the original six tables.
+
+**Idempotent-replay verification (Phase 4).** This ADR's original wording
+— "on a hit, the stored `response_body` is returned as-is" — assumed every
+retry with a matching `(user_id, key)` is a legitimate retry of the exact
+same request. Phase 4 had to make that concrete: what happens if the same
+user reuses a key with genuinely different request data (a different
+subject, a different recipient list)? Silently replaying the old response
+would be misleading (the caller would be told their *new* request
+succeeded, when what actually ran was the *old* one); silently creating a
+second campaign would violate the whole point of this table. The
+implemented behavior: on a hit, the retry's fields (`senderId`, `subject`,
+`body`, the recipient set, and any explicitly-provided
+`delayBetweenEmailsMs`/`hourlyLimit`) are compared against the campaign
+that `idempotency_keys.campaign_id` actually points to. A match returns the
+stored response (`200`). A mismatch returns `409
+IDEMPOTENCY_KEY_CONFLICT` and creates nothing — deterministic, safe, and
+never a silent duplicate in either direction. `start_at` is deliberately
+excluded from the comparison: when omitted it defaults to "now" on every
+call, so two legitimate retries a few hundred milliseconds apart would
+otherwise spuriously conflict on that field alone.
+
+The comparison is made against the **persisted campaign row itself**
+(joined through `idempotency_keys.campaign_id`), not against a separate
+stored request fingerprint. A dedicated fingerprint/hash column was
+considered and rejected: the campaign row already *is* the ground truth of
+what the original request produced, so comparing against it directly
+gets the same correctness without a schema change — consistent with Phase
+4's instruction to prefer the existing schema over adding to it unless
+genuinely necessary.
 
 ---
 
@@ -1023,3 +1072,76 @@ environment/config exactly as before (ADR-009) and is never read from a
 campaign row. The campaign's `hourly_limit` is read from the `campaigns` row
 (via the email's `campaign_id`) at check time. No change to `rate_windows`'s
 schema or write path from ADR-020.
+
+---
+
+## ADR-023: Temporary pre-OAuth development identity header (`X-Dev-User-Id`)
+
+**Status:** Accepted — **explicitly temporary**. Superseded in full by
+ADR-012's real session-cookie middleware once Phase 7 lands; this ADR
+should be marked superseded at that point, not deleted.
+
+**Context.** Phase 4 needed `POST /campaigns` to exist so the
+`idempotency_keys` behavior from ADR-018 could actually be tested end to
+end — and that endpoint needs to know *which user* is calling it, both to
+validate sender ownership (ADR-019: a campaign's `senderId` must belong to
+the caller) and to scope the idempotency key (ADR-018's `(user_id, key)`
+uniqueness). ADR-012's real Google OAuth flow is explicitly a later phase
+(Phase 7) and building it early, just to unblock this test, was out of
+scope and would have meant implementing a large, unrelated feature ahead of
+its planned order.
+
+**Decision.** A single-purpose middleware
+(`backend/src/middleware/devAuth.ts`) reads an `X-Dev-User-Id` header,
+looks it up against the real `users` table (rejecting an unknown or
+missing id with `401`), and attaches the result as `req.userId`. It is
+applied to exactly one route, `POST /campaigns`. It is not a session: no
+cookie, no token, no signature, no expiry — the caller states who they are
+by id and is trusted outright.
+
+**Why this is acceptable now, and why it must not be mistaken for the real
+thing.** Nothing downstream treats this as a security boundary yet: there
+is no production deployment in scope, no browser-facing session anywhere
+in the system, and the only thing this header can do is impersonate a
+`users.id` that must already exist in the seeded/dev database — there is no
+sign-up path through it, no privilege it grants beyond "act as this already
+-provisioned row." It exists solely to make ADR-018 and ADR-019's
+already-approved, already-documented behaviors testable now rather than
+leaving them theoretical until Phase 7.
+
+**Alternatives considered.**
+
+- **Build real Google OAuth now, out of order.** Rejected: explicitly
+  Phase 7's scope; pulling it forward to unblock a Phase 4 test would have
+  meant building and reviewing a large, unrelated feature (OAuth
+  redirect/callback flow, ID token verification, session cookie issuance)
+  under Phase 4's much narrower reliability mandate.
+- **No identity at all — accept a plain `userId` field in the request
+  body.** Rejected: this would make ADR-019's ownership check and
+  ADR-018's per-user key scoping untestable in any meaningful way, since
+  any caller could simply claim to be any user by writing a different id
+  into the body — indistinguishable, in a test, from having no ownership
+  check at all.
+- **A fuller mock-session system** (e.g. a `/dev/login` route issuing a
+  signed development cookie, mimicking the shape of the real session).
+  Rejected as more machinery than the actual need — Phase 4 needs *a*
+  caller identity to test against, not a second, parallel session
+  implementation that would itself need to be built carefully and then
+  torn out again at Phase 7.
+
+**Trade-offs / consequences.** This is trivially spoofable — any caller can
+claim to be any user id — and must never run in a real deployment. The
+blast radius is deliberately minimized: it is confined to one file, named
+and commented so it cannot be mistaken for production auth, and gates
+exactly one route. It is expected to be **deleted outright**, not extended
+or generalized, when Phase 7 replaces it.
+
+**Implementation implications.** `backend/src/middleware/devAuth.ts` sets
+`req.userId` after validating the header against a real `users` row;
+`POST /campaigns` is the only consumer. `docs/architecture.md`'s API table
+lists `POST /campaigns`'s Auth column as "session cookie" (the intended,
+final design) with a note pointing here for the current, temporary reality.
+When Phase 7 lands: this file is deleted, `POST /campaigns` (and every
+other protected route added by then) switches to the real session
+middleware, and this ADR is marked **Superseded by ADR-012** rather than
+removed from the record.

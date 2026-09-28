@@ -429,17 +429,26 @@ This system does **not** claim mathematically guaranteed exactly-once
 delivery, because that claim would be false. What it does instead:
 
 - The SMTP `Message-ID` returned by Ethereal is written to the row
-  immediately after the send call succeeds, in the same operation that would
-  set `status = 'sent'`. If the crash happens between the send and that
-  write, the row is left `processing` with no `message_id`.
-- The stuck-`processing` reconciliation pass (above) distinguishes two cases
-  when it finds a stale `processing` row: no `message_id` present means the
-  send itself likely never completed, and it is safe to retry; a
-  `message_id` present but `status` still `processing` means the send
-  completed but the status write did not, which is logged as an ambiguous
-  delivery for manual review rather than blindly resent (resending here
-  risks a real duplicate email to a real recipient, which the reconciliation
-  logic treats as the worse outcome of the two).
+  immediately after the send call succeeds, as its own statement —
+  deliberately **separate** from, and immediately followed by, the
+  statement that sets `status = 'sent'`. This is not incidental: a single
+  combined write would make the two crash outcomes below indistinguishable,
+  since Postgres's own atomicity means such a write either fully lands (the
+  row becomes `sent`) or not at all (`message_id` never gets set) — quietly
+  collapsing the "possibly already sent" case into the "safe to retry" case
+  the mechanism exists to tell apart. With two sequential writes: a crash
+  **before** the first one leaves the row `processing` with no
+  `message_id`; a crash **between** the two leaves `message_id` set but
+  `status` still `processing` — a narrow window, but a real and detectable
+  one.
+- The stuck-`processing` reconciliation pass (above) distinguishes exactly
+  those two cases when it finds a stale `processing` row: no `message_id`
+  present means the send itself likely never completed, and it is safe to
+  retry; a `message_id` present but `status` still `processing` means the
+  send completed but the status write did not, which is logged as an
+  ambiguous delivery for manual review rather than blindly resent (resending
+  here risks a real duplicate email to a real recipient, which the
+  reconciliation logic treats as the worse outcome of the two).
 
 In short: the system is **at-most-once in normal operation**, and the one
 window where that can't be guaranteed is detected and surfaced rather than
@@ -797,13 +806,21 @@ not sufficient to view the queue dashboard.
 
 ## API architecture
 
+The **Auth** column below states each route's intended, final auth
+requirement. `POST /campaigns` was implemented ahead of Phase 7 (to make
+Phase 4's idempotency-key behavior testable) and is currently gated by the
+temporary `X-Dev-User-Id` header instead of a real session cookie — see
+ADR-023. That row's "session cookie" therefore describes the design target,
+not (yet) the running code; ADR-023 is explicit that this is temporary and
+gets deleted, not extended, once Phase 7 lands.
+
 | Method & path | Purpose | Auth |
 | --- | --- | --- |
 | `GET /auth/google` | Start Google OAuth | none |
 | `GET /auth/google/callback` | Finish Google OAuth, set session cookie | none (validates OAuth state/code) |
 | `GET /auth/me` | Current user for the header | session cookie |
 | `POST /auth/logout` | Clear session | session cookie |
-| `POST /campaigns` | Create a campaign for one selected `senderId`, with optional `startAt`/`delayBetweenEmailsMs`/`hourlyLimit` overrides (ADR-021, ADR-022): insert email rows, enqueue jobs | session cookie |
+| `POST /campaigns` | Create a campaign for one selected `senderId`, with optional `startAt`/`delayBetweenEmailsMs`/`hourlyLimit` overrides (ADR-021, ADR-022): insert email rows, enqueue jobs | session cookie (temporarily: `X-Dev-User-Id` header, ADR-023) |
 | `GET /emails?status=scheduled` | Scheduled list, paginated | session cookie |
 | `GET /emails?status=sent` | Sent list, paginated (`sent`/`failed`) | session cookie |
 | `GET /emails/search` | Full-text search over all emails | session cookie |
