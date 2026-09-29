@@ -280,10 +280,10 @@ breaking correctness elsewhere in the system.
 drop or permanently fail jobs.
 
 **Decision.** A job that fails the Lua check is moved back to `scheduled`
-with `scheduled_at` set to the next window (plus jitter and an order-
-preserving offset), and a fresh BullMQ delayed job is added for it. The
-rejected attempt never increments the counter (see ADR-007's discussion of
-why check-then-increment, not increment-then-decrement, was chosen).
+with `scheduled_at` set to the next window (plus a small random jitter),
+and a fresh BullMQ delayed job is added for it. The rejected attempt never
+increments the counter (see ADR-007's discussion of why check-then-
+increment, not increment-then-decrement, was chosen).
 
 **Why.** This is close to a direct restatement of the requirement, so the
 interesting decision is *where* the retry lives: as data (a new
@@ -304,6 +304,17 @@ this to look like normal scheduling, not like error recovery.
 **Trade-offs.** None significant relative to the alternative; this is the
 more accurate representation of what's actually happening (the email isn't
 an error case, it's just waiting for a later window).
+
+**Implementation note.** The actual reschedule target computed by
+`processEmail.ts` is `next hour start + random jitter (0–250ms)` — a small
+random offset to avoid every job blocked in the same window retrying at
+the same instant, not a deterministic, position-based offset that
+preserves each email's relative order within its campaign. This decision's
+"don't drop it" guarantee is unaffected by that detail (every blocked job
+is still reliably rescheduled, never dropped or failed), but any reference
+elsewhere to an "order-preserving offset" for a *reschedule* (as opposed to
+an email's initial `scheduled_at`, which genuinely is computed from its
+ordinal position — see ADR-021) should be read as jitter-only.
 
 ---
 
@@ -772,8 +783,8 @@ directly in the database.
   it would complicate the `addBulk`/transaction step in the scheduling
   architecture for no graded benefit, and it would make a single campaign's
   rate-limit behavior span multiple Redis keys and multiple hourly windows
-  simultaneously, complicating both the demo and the order-preservation
-  logic from ADR-008.
+  simultaneously, complicating both the demo and the reschedule logic from
+  ADR-008.
 - **Add `POST /senders` now.** Rejected for this assignment: no current
   requirement needs user-created senders beyond what seeding already
   provides; this can be added later without conflicting with this decision.
@@ -896,9 +907,10 @@ implicitly submitted per campaign) and the documented enforcement mechanism
   what should happen.
 - Each email's initial `scheduled_at` is computed from the campaign's
   `start_at` plus an offset derived from `delay_between_emails_ms` and the
-  email's ordinal position within the campaign — the same order-preserving
-  offset logic ADR-008 already uses for rescheduling overflow, applied here
-  as the *initial* placement rather than only as a reschedule.
+  email's ordinal position within the campaign — a deterministic,
+  order-preserving placement applied once, at creation (see ADR-008's
+  implementation note: a later rate-limit *reschedule* uses random jitter
+  only, not this same ordinal-offset mechanism).
 - The existing sender-level Redis minimum-delay lock (ADR-006) is retained
   **exactly as-is, unmodified**, as a sender-wide safety floor across every
   campaign for that sender. It is not replaced, and it does not become
@@ -1009,8 +1021,7 @@ campaign individually approaches it.
   versa).
 - If **either** counter is exhausted, the email is rescheduled — never
   dropped or failed — using the existing reschedule-not-drop mechanism
-  (ADR-008), into the next window in which both counters have room, with
-  the existing order-preservation offset logic applied per campaign.
+  (ADR-008: next window start plus random jitter).
 
 **Rationale.** Checking both counters atomically in one script is what
 makes "two campaigns on the same sender cannot jointly exceed the sender's

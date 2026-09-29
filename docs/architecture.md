@@ -272,14 +272,21 @@ POST /campaigns  { senderId, subject, body, recipients[],
         campaign.delay_between_emails_ms), the same order-preserving
         offset logic ADR-008 uses for reschedules, applied here as the
         initial placement
-  → transaction commits
+      → if an Idempotency-Key was supplied, its idempotency_keys row
+        (keyed by (user_id, key), see ADR-018) is inserted here too —
+        in the SAME transaction as the campaign + email rows, not as a
+        separate step afterward. This is what makes the (user_id, key)
+        unique constraint the actual serialization point for two
+        concurrent identical requests: the loser's transaction fails on
+        that constraint before it can commit a second campaign, rather
+        than racing a check made outside the transaction.
+  → transaction commits (campaign + emails + idempotency claim, together)
   → one BullMQ job per email row, added with addBulk
       → job id = email id
       → delay = scheduled_at - now (ms)
   → Redis stores each job in its delayed set
   → at delay expiry, Redis moves the job to the waiting list
   → an idle worker picks it up and processes it
-  → response recorded in idempotency_keys, keyed by (user_id, key)
 ```
 
 **Sender selection.** A campaign has exactly one sender, chosen explicitly by
@@ -609,22 +616,22 @@ its own limit yet.
 
 **When either limit is hit:** the job is **not** dropped or marked
 `failed`. The worker moves the row back to `scheduled` with `scheduled_at`
-set to the start of the next hourly window in which *both* counters have
-room, plus a small jitter, and re-adds the BullMQ job with a new delay to
-match. Nothing about the email's content or destination changes — only when
-it will be attempted again. Order is preserved per campaign, using the same
-offset logic described below.
+set to the start of the next hourly window, plus a small random jitter
+(0–250ms, so every job blocked in the same window doesn't retry at exactly
+the same instant), and re-adds the BullMQ job with a new delay to match.
+Nothing about the email's content or destination changes — only when it
+will be attempted again.
 
-**Order preservation.** Within an overflow, jobs keep their original relative
-order *within their own campaign*, using their original `scheduled_at` as a
-tiebreaker: an email that was scheduled earlier is offset less into the
-next window than one scheduled later, spaced by that campaign's own
-`delay_between_emails_ms` apart. So if a campaign's emails 1–250 were all
-due in the same hour and that campaign's `hourly_limit` (or the sender-wide
-cap, whichever binds first) is 200, emails 1–200 send in this window and
-201–250 lead the next window, in that same relative order — they don't get
-shuffled to the back or interleaved with unrelated jobs that happen to
-already be due in the next window.
+**Ordering, as actually implemented.** The reschedule target is `next hour
+start + random jitter` for every email blocked in a given window — there is
+no deterministic, position-based offset applied at reschedule time (the
+per-recipient ordinal offset described in
+[Scheduling architecture](#scheduling-architecture) applies only to an
+email's *initial* `scheduled_at`, computed once at campaign creation). In
+practice this means emails that overflow the same hourly window land
+within a roughly 250ms band at the start of the next window, in no
+guaranteed relative order, rather than fanned out across the next window
+in their original sequence.
 
 **Safety across workers, senders, and campaigns.** Both Redis keys are
 scoped as documented above — one sender hitting its cap has no effect on
@@ -676,8 +683,8 @@ campaign's own limit is tighter than the sender's)
 - The hourly cap of 200 is reached well before an hour of attempts would
   complete. The 201st attempt for this sender in the window fails the Lua
   check, and that job (and every subsequent one for this sender in this
-  window) is rescheduled into the next hourly window, in original order, as
-  described above.
+  window) is rescheduled into the next hourly window (start-of-window plus
+  a small random jitter), as described above.
 - This repeats: roughly 200 send per hour, in 5 windows, until all 1000 are
   through. No job is ever dropped, failed, or silently lost — the "shape" of
   the backlog is visible in Postgres at any time as a count of `scheduled`
@@ -689,16 +696,16 @@ campaign's own limit is tighter than the sender's)
 - The system does not need to actually send 1000 emails through Ethereal to
   demonstrate this — the behavior is verified by lowering
   `MAX_EMAILS_PER_HOUR_PER_SENDER` to a small number (e.g. 3) and observing
-  the same reschedule-in-order logic at a scale that's easy to watch.
+  the same reschedule-not-drop behavior at a scale that's easy to watch.
 
 ---
 
 ## Slack rate-limit notification
 
 **OAuth.** "Connect Slack" starts a real OAuth authorize redirect
-(`GET /slack/install`) carrying a signed `state` value that encodes the
+(`GET /auth/slack/install`) carrying a signed `state` value that encodes the
 user id, so the callback can't be forged into attaching a token to the wrong
-account. The callback (`GET /slack/callback`) exchanges the code and stores
+account. The callback (`GET /auth/slack/callback`) exchanges the code and stores
 the resulting token and target (an incoming webhook, or a bot token plus
 channel id) in `slack_connections`, keyed by user.
 
@@ -737,8 +744,11 @@ worker required.
 scopes. `GET /auth/google` redirects to Google; Google redirects back to
 `GET /auth/google/callback` with a code; the API exchanges the code for
 tokens, verifies the ID token's signature and audience server-side (not just
-trusting a subsequent profile-endpoint call), and upserts a `users` row
-keyed by Google's stable subject id.
+trusting a subsequent profile-endpoint call), rejects the login outright if
+the token's `email_verified` claim isn't `true` (the email is later checked
+against `ADMIN_EMAILS` for Bull Board access, so an unverified email is a
+real authorization concern, not just a data-quality one), and upserts a
+`users` row keyed by Google's stable subject id.
 
 **Session.** The API issues an HTTP-only, signed session cookie (a signed
 JWT is sufficient; no separate session store is required). The cookie is set
@@ -791,13 +801,14 @@ the Scheduled/Sent list endpoints so the frontend's table component doesn't
 need special-casing.
 
 **Failure isolation.** Elasticsearch is explicitly a **read-side, best-effort**
-component. If an index call fails or Elasticsearch is unreachable, the
-worker logs the failure and continues — it does **not** fail the send, does
+component. If an index call fails or Elasticsearch is unreachable, `indexEmail()`
+logs the failure and swallows it — it does **not** fail the send, does
 **not** roll back the Postgres status write, and does not retry indexing
-inline on the hot send path. A small outbox (a queued "reindex this email"
-job, retried separately) is the mechanism for catching up once
-Elasticsearch is healthy again. Search results may lag or temporarily miss
-recent emails during an outage; scheduling and sending are never affected.
+inline on the hot send path, and there is no automatic background retry
+queue for it either. `backend/scripts/backfill-elasticsearch.ts` (see
+above) is the actual, on-demand catch-up mechanism, run manually after an
+outage. Search results may lag or temporarily miss recent emails during an
+outage; scheduling and sending are never affected.
 
 ---
 
@@ -835,10 +846,10 @@ of them — see ADR-023's now-superseded status for that migration.
 | `GET /emails?status=sent` | Sent list, paginated (`sent`/`failed`) | session cookie |
 | `GET /emails/search` | Full-text search over the caller's own emails only | session cookie |
 | `GET /senders` | Senders and their current-hour usage | session cookie |
-| `GET /slack/install` | Start Slack OAuth | session cookie |
-| `GET /slack/callback` | Finish Slack OAuth, store connection | session cookie (via signed `state`) |
-| `GET /slack/status` | Is Slack connected, for which team | session cookie |
-| `DELETE /slack` | Disconnect Slack | session cookie |
+| `GET /auth/slack/install` | Start Slack OAuth | session cookie |
+| `GET /auth/slack/callback` | Finish Slack OAuth, store connection | session cookie (via signed `state`) |
+| `GET /auth/slack/status` | Is Slack connected, for which team | session cookie |
+| `DELETE /auth/slack` | Disconnect Slack | session cookie |
 | `GET /admin/queues` | Bull Board UI | session cookie + `ADMIN_EMAILS` |
 
 All authenticated routes return `401` with `{ error: { code, message } }` on a
@@ -851,28 +862,42 @@ missing/invalid session, which the frontend treats uniformly.
 **Routes:**
 
 ```text
-/login                    Google sign-in button
-/dashboard                header, tabs, table, compose button
-/dashboard?tab=sent        Sent tab; tab state lives in the query string
+/                          Redirects to /dashboard or /login based on session
+/login                     Google sign-in button
+/dashboard                 header, sidebar, tabs, table, compose button, search
 ```
+
+Route protection is a client-side `RequireAuth` wrapper
+(`components/features/RequireAuth.tsx`), not a Next.js middleware: it reads
+the auth context and redirects to `/login` if there's no session once the
+initial `/auth/me` check resolves.
 
 **Structure:**
 
 ```text
-components/ui/            Button, Input, Textarea, Modal, Tabs, Table,
-                           Badge, Spinner, EmptyState, Toast
-components/features/      Header, EmailTable, ComposeModal, CsvUpload,
-                           SlackConnectCard
-lib/                       api.ts (typed fetch client), csv.ts (parsing)
-hooks/                     useEmails(status), useUser(), useSlackStatus(),
-                           useSenders()
-types/                     Email, Campaign, Sender, User, PaginatedResponse
+components/ui/             Button, Input, Textarea, Modal, Select, Avatar,
+                           Badge, Pagination, States (loading/empty/error), Toast
+components/features/      Header, Sidebar, EmailTable, ComposeModal,
+                           SearchResults, RequireAuth
+lib/                       api.ts (typed fetch client), auth-context.tsx
+                           (session state), parseRecipients.ts (recipient parsing)
+hooks/                     useEmails(status), useEmailSearch(), useCampaigns(),
+                           useSenders(), useSlackStatus(), useApiResource()
+types/                     api.ts — Email, Campaign, Sender, User,
+                           PaginatedResponse, SlackStatus
 ```
 
-**CSV parsing.** Done client-side in `lib/csv.ts`: split on commas and
-newlines, trim, lowercase, validate each address against a simple regex,
-drop duplicates, and surface a count of valid vs. rejected addresses in the
-compose modal before the user submits.
+**Recipient parsing.** Done client-side in `lib/parseRecipients.ts`: splits
+on commas and newlines (so a pasted list and an uploaded CSV/text file are
+handled the same way), trims, validates each address against a regex, and
+reports three buckets — valid, invalid, and duplicate — rather than
+silently dropping anything, since the backend itself rejects a campaign
+containing duplicate recipients (`createCampaign.ts`) rather than
+deduping them.
+
+**Search.** Typing in the sidebar's search field renders `SearchResults`
+(query-driven) in place of the dashboard's normal tab content, backed by
+`GET /emails/search` via `useEmailSearch()`.
 
 **Compose modal.** A sender selector (populated from `GET /senders` via
 `useSenders()`), subject, body, and the parsed recipient list are required —
@@ -896,7 +921,7 @@ skeleton loading state, an explicit empty state with a call to action, and an
 error state with retry. The Scheduled tab polls on an interval so rows move
 to Sent without a manual refresh.
 
-**Slack card.** A small dashboard card that reads `GET /slack/status` and
+**Slack card.** A small dashboard card that reads `GET /auth/slack/status` and
 shows either "Connect Slack" or the connected workspace name with a
 Disconnect action.
 
