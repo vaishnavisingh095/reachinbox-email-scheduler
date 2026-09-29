@@ -9,9 +9,11 @@ A restart-safe, rate-limited email campaign scheduler. See
 reliability/idempotency, rate limiting, the campaign/senders/emails read
 API, Elasticsearch search, Bull Board, Google OAuth + sessions, and Slack
 OAuth + rate-limit notifications all exist and are wired together. The
-Next.js frontend is still just the Phase 1 shell page — no dashboard or
-compose UI yet. This README will be expanded into the full submission
-README later; for now it covers what's needed to run what exists.
+Next.js frontend is a real dashboard connected to this backend — login,
+scheduled/sent tables, compose (CSV/text recipients), Slack connect card,
+and search — no mock data. This README will be expanded into the full
+submission README later; for now it covers what's needed to run what
+exists.
 
 ## Prerequisites
 
@@ -126,17 +128,30 @@ is scoped to the caller's own emails.
 ## Running the frontend
 
 ```bash
+cp frontend/.env.example frontend/.env.local
 npm run dev:frontend
 ```
 
-Loads at `http://localhost:3000` — currently a minimal shell page only; no
-dashboard, auth, or campaign UI yet.
+Loads at `http://localhost:3000`. `frontend/.env.local` sets
+`NEXT_PUBLIC_API_URL` (default `http://localhost:4000`) — the frontend and
+API are separate origins; the API's session cookie lives on the API's own
+origin and is sent automatically on credentialed cross-origin requests
+(`credentials: "include"` in `frontend/src/lib/api.ts`), gated by CORS on
+the API side (`backend/src/app.ts`, restricted to `FRONTEND_URL`).
+
+Flow: `/login` → "Continue with Google" navigates the browser to the API's
+`/auth/google` (a real top-level redirect, not a fetch) → Google → the
+API's callback sets the session cookie and redirects back to
+`/dashboard`. Logout calls `POST /auth/logout` on the API.
 
 Other frontend scripts: `npm run build:frontend`, `npm run typecheck:frontend`,
 `npm run lint --workspace frontend`.
 
 ## Environment variables
 
-`.env.example` lists every variable this system uses, matching
+`.env.example` (repo root) lists every backend variable, matching
 `docs/architecture.md`'s documented list exactly, with setup notes for the
-Google/Slack credentials above.
+Google/Slack credentials above. `frontend/.env.example` covers the
+frontend's one variable, `NEXT_PUBLIC_API_URL`, which is separate from
+that list (a frontend build-time concern, not part of the backend's
+documented environment).

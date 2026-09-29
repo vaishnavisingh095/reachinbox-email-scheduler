@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 
-const SLACK_REDIRECT_URI = `${env.API_URL}/slack/callback`;
+const SLACK_REDIRECT_URI = `${env.API_URL}/auth/slack/callback`;
 
 /**
  * architecture.md's Slack OAuth section: "a signed `state` value that
